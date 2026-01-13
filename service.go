@@ -11,16 +11,8 @@ import (
 	"strings"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
 )
-
-// RedisClient Redis 客户端接口（用于解耦内核依赖）
-type RedisClient interface {
-	Get(ctx context.Context, key string) *goredis.StringCmd
-	Set(ctx context.Context, key string, value interface{}, expiration time.Duration) *goredis.StatusCmd
-	Del(ctx context.Context, keys ...string) *goredis.IntCmd
-	Keys(ctx context.Context, pattern string) *goredis.StringSliceCmd
-}
 
 // SortOrder 排序方式
 type SortOrder string
@@ -51,7 +43,7 @@ type FileContent struct {
 // Service 文档服务
 type Service struct {
 	basePath    string        // 允许访问的基础目录
-	redisClient RedisClient   // Redis 客户端（通过内核获取）
+	redisClient *redis.Client // Redis 客户端（内核 redis.Manager.Client()）
 	cachePrefix string        // 缓存键前缀
 	cacheTTL    time.Duration // 缓存过期时间
 }
@@ -60,10 +52,8 @@ type Service struct {
 type ServiceOption func(*Service)
 
 // WithRedisCache 设置 Redis 缓存
-// client: Redis 客户端（通过内核 redisManager.Client("main") 获取）
-// prefix: 缓存键前缀
-// ttl: 缓存过期时间
-func WithRedisCache(client RedisClient, prefix string, ttl time.Duration) ServiceOption {
+// client: 内核 Redis 客户端（apputil.GetRedisClient(app)）
+func WithRedisCache(client *redis.Client, prefix string, ttl time.Duration) ServiceOption {
 	return func(s *Service) {
 		s.redisClient = client
 		s.cachePrefix = prefix
