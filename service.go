@@ -22,14 +22,21 @@ const (
 	SortAsc  SortOrder = "asc"  // 正序（最旧在前）
 )
 
+// DirectoryConfig 目录配置
+type DirectoryConfig struct {
+	Name string // 目录别名
+	Path string // 目录绝对路径
+}
+
 // FileInfo 文件信息
 type FileInfo struct {
-	Name    string    `json:"name"`
-	Title   string    `json:"title,omitempty"` // 文章标题（从第一行解析）
-	Path    string    `json:"path"`            // 相对路径
-	Size    int64     `json:"size"`
-	IsDir   bool      `json:"is_dir"`
-	ModTime time.Time `json:"mod_time"`
+	Name      string    `json:"name"`
+	Title     string    `json:"title,omitempty"` // 文章标题（从第一行解析）
+	Path      string    `json:"path"`            // 相对路径
+	Size      int64     `json:"size"`
+	IsDir     bool      `json:"is_dir"`
+	ModTime   time.Time `json:"mod_time"`
+	Directory string    `json:"directory"` // 所属目录别名
 }
 
 // FileContent 文件内容
@@ -42,10 +49,13 @@ type FileContent struct {
 
 // Service 文档服务
 type Service struct {
-	basePath    string        // 允许访问的基础目录
-	redisClient *redis.Client // Redis 客户端（内核 redis.Manager.Client()）
-	cachePrefix string        // 缓存键前缀
-	cacheTTL    time.Duration // 缓存过期时间
+	basePath    string              // 允许访问的基础目录（兼容旧 API）
+	directories []DirectoryConfig   // 多目录配置
+	extensions  []string            // 允许的文件后缀
+	dirMap      map[string]string   // 目录别名 -> 绝对路径
+	redisClient *redis.Client       // Redis 客户端（内核 redis.Manager.Client()）
+	cachePrefix string              // 缓存键前缀
+	cacheTTL    time.Duration       // 缓存过期时间
 }
 
 // ServiceOption 服务选项
@@ -58,6 +68,27 @@ func WithRedisCache(client *redis.Client, prefix string, ttl time.Duration) Serv
 		s.redisClient = client
 		s.cachePrefix = prefix
 		s.cacheTTL = ttl
+	}
+}
+
+// WithDirectories 设置多目录配置
+func WithDirectories(dirs []DirectoryConfig) ServiceOption {
+	return func(s *Service) {
+		s.directories = dirs
+		s.dirMap = make(map[string]string)
+		for _, d := range dirs {
+			absPath, err := filepath.Abs(d.Path)
+			if err == nil {
+				s.dirMap[d.Name] = absPath
+			}
+		}
+	}
+}
+
+// WithExtensions 设置允许的文件后缀
+func WithExtensions(exts []string) ServiceOption {
+	return func(s *Service) {
+		s.extensions = exts
 	}
 }
 
@@ -80,8 +111,62 @@ func NewService(basePath string, opts ...ServiceOption) (*Service, error) {
 
 	svc := &Service{
 		basePath:    absPath,
+		extensions:  []string{".md"}, // 默认只支持 .md
+		dirMap:      make(map[string]string),
 		cachePrefix: "docs:title:",
 		cacheTTL:    24 * time.Hour, // 默认 24 小时
+	}
+
+	// 应用选项
+	for _, opt := range opts {
+		opt(svc)
+	}
+
+	return svc, nil
+}
+
+// NewMultiDirService 创建多目录文档服务
+func NewMultiDirService(dirs []DirectoryConfig, exts []string, opts ...ServiceOption) (*Service, error) {
+	if len(dirs) == 0 {
+		return nil, ErrDirectoryNotFound
+	}
+
+	svc := &Service{
+		directories: dirs,
+		extensions:  exts,
+		dirMap:      make(map[string]string),
+		cachePrefix: "docs:title:",
+		cacheTTL:    24 * time.Hour,
+	}
+
+	// 验证并映射目录
+	for _, d := range dirs {
+		absPath, err := filepath.Abs(d.Path)
+		if err != nil {
+			continue // 跳过无效路径
+		}
+		info, err := os.Stat(absPath)
+		if err != nil || !info.IsDir() {
+			continue // 跳过不存在的目录
+		}
+		svc.dirMap[d.Name] = absPath
+	}
+
+	if len(svc.dirMap) == 0 {
+		return nil, ErrDirectoryNotFound
+	}
+
+	// 设置 basePath 为第一个有效目录（兼容旧 API）
+	for _, d := range dirs {
+		if path, ok := svc.dirMap[d.Name]; ok {
+			svc.basePath = path
+			break
+		}
+	}
+
+	// 默认后缀
+	if len(svc.extensions) == 0 {
+		svc.extensions = []string{".md"}
 	}
 
 	// 应用选项
@@ -168,6 +253,180 @@ func (s *Service) ListFiles(relativePath string, order SortOrder) ([]FileInfo, e
 	}
 
 	return files, nil
+}
+
+// ListAllFiles 从所有配置目录递归查找文件
+// 返回所有目录下符合后缀过滤的文件，归并排序后返回
+func (s *Service) ListAllFiles(order SortOrder) ([]FileInfo, error) {
+	var allFiles []FileInfo
+
+	for dirName, dirPath := range s.dirMap {
+		files, err := s.walkDirectory(dirName, dirPath)
+		if err != nil {
+			continue // 跳过出错的目录
+		}
+		allFiles = append(allFiles, files...)
+	}
+
+	// 按修改时间排序
+	s.sortFiles(allFiles, order)
+
+	return allFiles, nil
+}
+
+// walkDirectory 递归遍历单个目录
+func (s *Service) walkDirectory(dirName, basePath string) ([]FileInfo, error) {
+	var files []FileInfo
+
+	err := filepath.WalkDir(basePath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil // 跳过错误
+		}
+
+		// 跳过隐藏文件和目录
+		if strings.HasPrefix(d.Name(), ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// 跳过目录本身，只处理文件
+		if d.IsDir() {
+			return nil
+		}
+
+		// 检查文件后缀
+		if !s.hasValidExtension(d.Name()) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+
+		// 计算相对路径
+		relPath, _ := filepath.Rel(basePath, path)
+
+		fileInfo := FileInfo{
+			Name:      d.Name(),
+			Path:      relPath,
+			Size:      info.Size(),
+			IsDir:     false,
+			ModTime:   info.ModTime(),
+			Directory: dirName,
+		}
+
+		// 解析文件标题
+		if s.hasExtension(d.Name(), ".md") {
+			fileInfo.Title = s.getArticleTitle(path, relPath)
+		}
+
+		files = append(files, fileInfo)
+		return nil
+	})
+
+	if err != nil {
+		return nil, ErrReadFailed
+	}
+
+	return files, nil
+}
+
+// hasValidExtension 检查文件是否有有效后缀
+func (s *Service) hasValidExtension(name string) bool {
+	for _, ext := range s.extensions {
+		if strings.HasSuffix(strings.ToLower(name), strings.ToLower(ext)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExtension 检查文件是否有指定后缀
+func (s *Service) hasExtension(name, ext string) bool {
+	return strings.HasSuffix(strings.ToLower(name), strings.ToLower(ext))
+}
+
+// sortFiles 对文件列表排序
+func (s *Service) sortFiles(files []FileInfo, order SortOrder) {
+	if order == SortAsc {
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].ModTime.Before(files[j].ModTime)
+		})
+	} else {
+		sort.Slice(files, func(i, j int) bool {
+			return files[i].ModTime.After(files[j].ModTime)
+		})
+	}
+}
+
+// GetDirectories 获取所有配置的目录
+func (s *Service) GetDirectories() []DirectoryConfig {
+	return s.directories
+}
+
+// GetDirectoryPath 根据别名获取目录路径
+func (s *Service) GetDirectoryPath(name string) (string, bool) {
+	path, ok := s.dirMap[name]
+	return path, ok
+}
+
+// ReadFileFromDir 从指定目录读取文件
+func (s *Service) ReadFileFromDir(dirName, relativePath string) (*FileContent, error) {
+	basePath, ok := s.dirMap[dirName]
+	if !ok {
+		return nil, ErrDirectoryNotFound
+	}
+
+	// 安全检查
+	cleanPath := filepath.Clean(relativePath)
+	if strings.Contains(cleanPath, "..") || filepath.IsAbs(cleanPath) {
+		return nil, ErrPathTraversal
+	}
+
+	fullPath := filepath.Join(basePath, cleanPath)
+	absPath, err := filepath.Abs(fullPath)
+	if err != nil {
+		return nil, ErrPathNotAllowed
+	}
+
+	// 确保路径在基础目录内
+	rel, err := filepath.Rel(basePath, absPath)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return nil, ErrPathTraversal
+	}
+
+	// 检查文件
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrFileNotFound
+		}
+		return nil, ErrReadFailed
+	}
+	if info.IsDir() {
+		return nil, ErrFileNotFound
+	}
+
+	// 限制文件大小（10MB）
+	const maxSize = 10 * 1024 * 1024
+	if info.Size() > maxSize {
+		return nil, ErrReadFailed
+	}
+
+	content, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, ErrReadFailed
+	}
+
+	return &FileContent{
+		Name:    filepath.Base(relativePath),
+		Path:    relativePath,
+		Content: string(content),
+		Size:    info.Size(),
+	}, nil
 }
 
 // ReadFile 读取文件内容
