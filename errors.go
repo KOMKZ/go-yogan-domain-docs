@@ -6,7 +6,7 @@ import (
 	"github.com/KOMKZ/go-yogan-framework/errcode"
 )
 
-const ModuleDocs = 27
+const ModuleDocs = 22
 
 var (
 	ErrPathNotAllowed    = errcode.Register(errcode.New(ModuleDocs, 1001, "docs", "error.docs.path_not_allowed", "路径不允许访问", http.StatusForbidden))
