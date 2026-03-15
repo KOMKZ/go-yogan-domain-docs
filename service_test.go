@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestListFiles_Success(t *testing.T) {
@@ -182,5 +183,83 @@ func TestGetArticleTitle_Success(t *testing.T) {
 	}
 	if files[0].Title != "My Article Title" {
 		t.Errorf("expected title 'My Article Title', got %q", files[0].Title)
+	}
+}
+
+func TestListAllFiles_SortByName(t *testing.T) {
+	dir := t.TempDir()
+	alpha := filepath.Join(dir, "alpha.md")
+	zeta := filepath.Join(dir, "zeta.md")
+	_ = os.WriteFile(alpha, []byte("# A"), 0644)
+	_ = os.WriteFile(zeta, []byte("# Z"), 0644)
+
+	now := time.Now()
+	_ = os.Chtimes(alpha, now, now.Add(2*time.Hour))
+	_ = os.Chtimes(zeta, now, now.Add(-2*time.Hour))
+
+	svc, err := NewMultiDirService([]DirectoryConfig{{Name: "docs", Path: dir}}, []string{".md"})
+	if err != nil {
+		t.Fatalf("NewMultiDirService: %v", err)
+	}
+
+	ascFiles, err := svc.ListAllFiles(SortAsc, SortByName)
+	if err != nil {
+		t.Fatalf("ListAllFiles asc name: %v", err)
+	}
+	if len(ascFiles) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(ascFiles))
+	}
+	if ascFiles[0].Name != "alpha.md" {
+		t.Fatalf("expected alpha.md first in asc name sort, got %s", ascFiles[0].Name)
+	}
+
+	descFiles, err := svc.ListAllFiles(SortDesc, SortByName)
+	if err != nil {
+		t.Fatalf("ListAllFiles desc name: %v", err)
+	}
+	if len(descFiles) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(descFiles))
+	}
+	if descFiles[0].Name != "zeta.md" {
+		t.Fatalf("expected zeta.md first in desc name sort, got %s", descFiles[0].Name)
+	}
+}
+
+func TestListAllFiles_SortByModTime(t *testing.T) {
+	dir := t.TempDir()
+	oldFile := filepath.Join(dir, "old.md")
+	newFile := filepath.Join(dir, "new.md")
+	_ = os.WriteFile(oldFile, []byte("# Old"), 0644)
+	_ = os.WriteFile(newFile, []byte("# New"), 0644)
+
+	base := time.Now().Add(-3 * time.Hour)
+	_ = os.Chtimes(oldFile, base, base)
+	_ = os.Chtimes(newFile, base.Add(2*time.Hour), base.Add(2*time.Hour))
+
+	svc, err := NewMultiDirService([]DirectoryConfig{{Name: "docs", Path: dir}}, []string{".md"})
+	if err != nil {
+		t.Fatalf("NewMultiDirService: %v", err)
+	}
+
+	descFiles, err := svc.ListAllFiles(SortDesc, SortByModTime)
+	if err != nil {
+		t.Fatalf("ListAllFiles desc mod_time: %v", err)
+	}
+	if len(descFiles) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(descFiles))
+	}
+	if descFiles[0].Name != "new.md" {
+		t.Fatalf("expected new.md first in desc mod_time sort, got %s", descFiles[0].Name)
+	}
+
+	ascFiles, err := svc.ListAllFiles(SortAsc, SortByModTime)
+	if err != nil {
+		t.Fatalf("ListAllFiles asc mod_time: %v", err)
+	}
+	if len(ascFiles) != 2 {
+		t.Fatalf("expected 2 files, got %d", len(ascFiles))
+	}
+	if ascFiles[0].Name != "old.md" {
+		t.Fatalf("expected old.md first in asc mod_time sort, got %s", ascFiles[0].Name)
 	}
 }

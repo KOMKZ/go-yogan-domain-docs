@@ -22,6 +22,14 @@ const (
 	SortAsc  SortOrder = "asc"  // 正序（最旧在前）
 )
 
+// SortBy 排序字段
+type SortBy string
+
+const (
+	SortByModTime SortBy = "mod_time" // 按修改时间排序（默认）
+	SortByName    SortBy = "name"     // 按文件名排序
+)
+
 // DirectoryConfig 目录配置
 type DirectoryConfig struct {
 	Name string // 目录别名
@@ -49,13 +57,13 @@ type FileContent struct {
 
 // Service 文档服务
 type Service struct {
-	basePath    string              // 允许访问的基础目录（兼容旧 API）
-	directories []DirectoryConfig   // 多目录配置
-	extensions  []string            // 允许的文件后缀
-	dirMap      map[string]string   // 目录别名 -> 绝对路径
-	redisClient *redis.Client       // Redis 客户端（内核 redis.Manager.Client()）
-	cachePrefix string              // 缓存键前缀
-	cacheTTL    time.Duration       // 缓存过期时间
+	basePath    string            // 允许访问的基础目录（兼容旧 API）
+	directories []DirectoryConfig // 多目录配置
+	extensions  []string          // 允许的文件后缀
+	dirMap      map[string]string // 目录别名 -> 绝对路径
+	redisClient *redis.Client     // Redis 客户端（内核 redis.Manager.Client()）
+	cachePrefix string            // 缓存键前缀
+	cacheTTL    time.Duration     // 缓存过期时间
 }
 
 // ServiceOption 服务选项
@@ -257,7 +265,7 @@ func (s *Service) ListFiles(relativePath string, order SortOrder) ([]FileInfo, e
 
 // ListAllFiles 从所有配置目录递归查找文件
 // 返回所有目录下符合后缀过滤的文件，归并排序后返回
-func (s *Service) ListAllFiles(order SortOrder) ([]FileInfo, error) {
+func (s *Service) ListAllFiles(order SortOrder, sortBy SortBy) ([]FileInfo, error) {
 	var allFiles []FileInfo
 
 	for dirName, dirPath := range s.dirMap {
@@ -268,8 +276,11 @@ func (s *Service) ListAllFiles(order SortOrder) ([]FileInfo, error) {
 		allFiles = append(allFiles, files...)
 	}
 
-	// 按修改时间排序
-	s.sortFiles(allFiles, order)
+	if sortBy != SortByName {
+		sortBy = SortByModTime
+	}
+
+	s.sortFiles(allFiles, order, sortBy)
 
 	return allFiles, nil
 }
@@ -350,16 +361,51 @@ func (s *Service) hasExtension(name, ext string) bool {
 }
 
 // sortFiles 对文件列表排序
-func (s *Service) sortFiles(files []FileInfo, order SortOrder) {
-	if order == SortAsc {
-		sort.Slice(files, func(i, j int) bool {
-			return files[i].ModTime.Before(files[j].ModTime)
-		})
-	} else {
-		sort.Slice(files, func(i, j int) bool {
-			return files[i].ModTime.After(files[j].ModTime)
-		})
+func (s *Service) sortFiles(files []FileInfo, order SortOrder, sortBy SortBy) {
+	isAsc := order == SortAsc
+
+	compareText := func(a, b string) int {
+		return strings.Compare(strings.ToLower(a), strings.ToLower(b))
 	}
+
+	compareTime := func(a, b time.Time) int {
+		if a.Before(b) {
+			return -1
+		}
+		if a.After(b) {
+			return 1
+		}
+		return 0
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		left := files[i]
+		right := files[j]
+
+		cmp := 0
+		if sortBy == SortByName {
+			cmp = compareText(left.Name, right.Name)
+			if cmp == 0 {
+				cmp = compareText(left.Path, right.Path)
+			}
+			if cmp == 0 {
+				cmp = compareTime(left.ModTime, right.ModTime)
+			}
+		} else {
+			cmp = compareTime(left.ModTime, right.ModTime)
+			if cmp == 0 {
+				cmp = compareText(left.Name, right.Name)
+			}
+			if cmp == 0 {
+				cmp = compareText(left.Path, right.Path)
+			}
+		}
+
+		if isAsc {
+			return cmp < 0
+		}
+		return cmp > 0
+	})
 }
 
 // GetDirectories 获取所有配置的目录
