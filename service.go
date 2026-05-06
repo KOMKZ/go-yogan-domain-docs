@@ -55,6 +55,16 @@ type FileContent struct {
 	Size    int64  `json:"size"`
 }
 
+// DirectoryTreeNode 目录树节点
+// Path 表示相对根目录的目录路径；根节点固定为空字符串。
+type DirectoryTreeNode struct {
+	Name      string              `json:"name"`
+	Path      string              `json:"path"`
+	Directory string              `json:"directory"`
+	FileCount int                 `json:"file_count"`
+	Children  []DirectoryTreeNode `json:"children,omitempty"`
+}
+
 // Service 文档服务
 type Service struct {
 	basePath    string            // 允许访问的基础目录（兼容旧 API）
@@ -406,6 +416,92 @@ func (s *Service) sortFiles(files []FileInfo, order SortOrder, sortBy SortBy) {
 		}
 		return cmp > 0
 	})
+}
+
+// ListDirectoryTree 获取所有配置目录的树结构。
+func (s *Service) ListDirectoryTree() ([]DirectoryTreeNode, error) {
+	trees := make([]DirectoryTreeNode, 0, len(s.directories))
+
+	for _, configuredDir := range s.directories {
+		basePath, ok := s.dirMap[configuredDir.Name]
+		if !ok {
+			continue
+		}
+
+		root := DirectoryTreeNode{
+			Name:      configuredDir.Name,
+			Path:      "",
+			Directory: configuredDir.Name,
+		}
+
+		files, err := s.walkDirectory(configuredDir.Name, basePath)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, file := range files {
+			root.FileCount++
+			parentDir := filepath.Dir(file.Path)
+			if parentDir == "." {
+				continue
+			}
+			s.insertDirectoryPath(&root, parentDir)
+		}
+
+		s.sortDirectoryTree(&root)
+		trees = append(trees, root)
+	}
+
+	return trees, nil
+}
+
+func (s *Service) insertDirectoryPath(root *DirectoryTreeNode, relativeDir string) {
+	segments := strings.Split(relativeDir, string(filepath.Separator))
+	current := root
+
+	for _, segment := range segments {
+		if segment == "" || segment == "." {
+			continue
+		}
+
+		childIndex := -1
+		for i := range current.Children {
+			if current.Children[i].Name == segment {
+				childIndex = i
+				break
+			}
+		}
+
+		if childIndex < 0 {
+			childPath := segment
+			if current.Path != "" {
+				childPath = filepath.Join(current.Path, segment)
+			}
+			current.Children = append(current.Children, DirectoryTreeNode{
+				Name:      segment,
+				Path:      childPath,
+				Directory: root.Directory,
+			})
+			childIndex = len(current.Children) - 1
+		}
+
+		current = &current.Children[childIndex]
+		current.FileCount++
+	}
+}
+
+func (s *Service) sortDirectoryTree(node *DirectoryTreeNode) {
+	if len(node.Children) == 0 {
+		return
+	}
+
+	sort.Slice(node.Children, func(i, j int) bool {
+		return strings.ToLower(node.Children[i].Name) < strings.ToLower(node.Children[j].Name)
+	})
+
+	for i := range node.Children {
+		s.sortDirectoryTree(&node.Children[i])
+	}
 }
 
 // GetDirectories 获取所有配置的目录

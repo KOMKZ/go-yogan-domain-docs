@@ -263,3 +263,81 @@ func TestListAllFiles_SortByModTime(t *testing.T) {
 		t.Fatalf("expected old.md first in asc mod_time sort, got %s", ascFiles[0].Name)
 	}
 }
+
+func TestListDirectoryTree_Success(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+
+	mustWriteTestFile(t, filepath.Join(rootA, "guides", "intro.md"), "# Intro")
+	mustWriteTestFile(t, filepath.Join(rootA, "guides", "advanced", "deep.md"), "# Deep")
+	mustWriteTestFile(t, filepath.Join(rootA, ".hidden", "skip.md"), "# Skip")
+	mustWriteTestFile(t, filepath.Join(rootB, "examples", "demo.txt"), "demo")
+	mustWriteTestFile(t, filepath.Join(rootB, "ignore.pdf"), "ignore")
+
+	svc, err := NewMultiDirService([]DirectoryConfig{
+		{Name: "articles", Path: rootA},
+		{Name: "samples", Path: rootB},
+	}, []string{".md", ".txt"})
+	if err != nil {
+		t.Fatalf("NewMultiDirService: %v", err)
+	}
+
+	tree, err := svc.ListDirectoryTree()
+	if err != nil {
+		t.Fatalf("ListDirectoryTree: %v", err)
+	}
+	if len(tree) != 2 {
+		t.Fatalf("expected 2 root nodes, got %d", len(tree))
+	}
+
+	articles := tree[0]
+	if articles.Name != "articles" {
+		t.Fatalf("expected first root to be articles, got %s", articles.Name)
+	}
+	if articles.Path != "" {
+		t.Fatalf("expected root path empty, got %q", articles.Path)
+	}
+	if articles.FileCount != 2 {
+		t.Fatalf("expected articles root count 2, got %d", articles.FileCount)
+	}
+	if len(articles.Children) != 1 || articles.Children[0].Name != "guides" {
+		t.Fatalf("expected guides child under articles, got %#v", articles.Children)
+	}
+	guides := articles.Children[0]
+	if guides.Path != "guides" {
+		t.Fatalf("expected guides path, got %q", guides.Path)
+	}
+	if guides.FileCount != 2 {
+		t.Fatalf("expected guides count 2, got %d", guides.FileCount)
+	}
+	if len(guides.Children) != 1 || guides.Children[0].Name != "advanced" {
+		t.Fatalf("expected advanced child under guides, got %#v", guides.Children)
+	}
+	if guides.Children[0].Path != filepath.Join("guides", "advanced") {
+		t.Fatalf("unexpected advanced path: %q", guides.Children[0].Path)
+	}
+	if guides.Children[0].FileCount != 1 {
+		t.Fatalf("expected advanced count 1, got %d", guides.Children[0].FileCount)
+	}
+
+	samples := tree[1]
+	if samples.Name != "samples" {
+		t.Fatalf("expected second root to be samples, got %s", samples.Name)
+	}
+	if samples.FileCount != 1 {
+		t.Fatalf("expected samples root count 1, got %d", samples.FileCount)
+	}
+	if len(samples.Children) != 1 || samples.Children[0].Name != "examples" {
+		t.Fatalf("expected examples child under samples, got %#v", samples.Children)
+	}
+}
+
+func mustWriteTestFile(t *testing.T, filePath, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filePath), 0o755); err != nil {
+		t.Fatalf("MkdirAll %s: %v", filePath, err)
+	}
+	if err := os.WriteFile(filePath, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile %s: %v", filePath, err)
+	}
+}
