@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -74,6 +75,11 @@ type Service struct {
 	redisClient *redis.Client     // Redis 客户端（内核 redis.Manager.Client()）
 	cachePrefix string            // 缓存键前缀
 	cacheTTL    time.Duration     // 缓存过期时间
+	indexMu     sync.RWMutex
+	indexCache  []FileInfo
+	indexExpiry time.Time
+	indexTTL    time.Duration
+	indexDirMts map[string]time.Time
 }
 
 // ServiceOption 服务选项
@@ -133,6 +139,7 @@ func NewService(basePath string, opts ...ServiceOption) (*Service, error) {
 		dirMap:      make(map[string]string),
 		cachePrefix: "docs:title:",
 		cacheTTL:    24 * time.Hour, // 默认 24 小时
+		indexTTL:    30 * time.Second,
 	}
 
 	// 应用选项
@@ -155,6 +162,7 @@ func NewMultiDirService(dirs []DirectoryConfig, exts []string, opts ...ServiceOp
 		dirMap:      make(map[string]string),
 		cachePrefix: "docs:title:",
 		cacheTTL:    24 * time.Hour,
+		indexTTL:    30 * time.Second,
 	}
 
 	// 验证并映射目录
@@ -276,14 +284,9 @@ func (s *Service) ListFiles(relativePath string, order SortOrder) ([]FileInfo, e
 // ListAllFiles 从所有配置目录递归查找文件
 // 返回所有目录下符合后缀过滤的文件，归并排序后返回
 func (s *Service) ListAllFiles(order SortOrder, sortBy SortBy) ([]FileInfo, error) {
-	var allFiles []FileInfo
-
-	for dirName, dirPath := range s.dirMap {
-		files, err := s.walkDirectory(dirName, dirPath)
-		if err != nil {
-			continue // 跳过出错的目录
-		}
-		allFiles = append(allFiles, files...)
+	allFiles, err := s.getAllFilesSnapshot()
+	if err != nil {
+		return nil, err
 	}
 
 	if sortBy != SortByName {
@@ -293,6 +296,76 @@ func (s *Service) ListAllFiles(order SortOrder, sortBy SortBy) ([]FileInfo, erro
 	s.sortFiles(allFiles, order, sortBy)
 
 	return allFiles, nil
+}
+
+func (s *Service) getAllFilesSnapshot() ([]FileInfo, error) {
+	now := time.Now()
+	s.indexMu.RLock()
+	if s.isIndexCacheFreshLocked(now) {
+		files := cloneFileInfos(s.indexCache)
+		s.indexMu.RUnlock()
+		return files, nil
+	}
+	s.indexMu.RUnlock()
+
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+
+	if s.isIndexCacheFreshLocked(time.Now()) {
+		return cloneFileInfos(s.indexCache), nil
+	}
+
+	var allFiles []FileInfo
+	for dirName, dirPath := range s.dirMap {
+		files, err := s.walkDirectory(dirName, dirPath)
+		if err != nil {
+			continue // 跳过出错的目录
+		}
+		allFiles = append(allFiles, files...)
+	}
+
+	s.indexCache = cloneFileInfos(allFiles)
+	s.indexExpiry = time.Now().Add(s.indexTTL)
+	s.indexDirMts = s.currentDirectoryModTimes()
+
+	return allFiles, nil
+}
+
+func (s *Service) isIndexCacheFreshLocked(now time.Time) bool {
+	if !now.Before(s.indexExpiry) || s.indexCache == nil {
+		return false
+	}
+	for dirName, dirPath := range s.dirMap {
+		info, err := os.Stat(dirPath)
+		if err != nil || !info.IsDir() {
+			return false
+		}
+		cachedModTime, ok := s.indexDirMts[dirName]
+		if !ok || !info.ModTime().Equal(cachedModTime) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) currentDirectoryModTimes() map[string]time.Time {
+	modTimes := make(map[string]time.Time, len(s.dirMap))
+	for dirName, dirPath := range s.dirMap {
+		info, err := os.Stat(dirPath)
+		if err == nil && info.IsDir() {
+			modTimes[dirName] = info.ModTime()
+		}
+	}
+	return modTimes
+}
+
+func cloneFileInfos(files []FileInfo) []FileInfo {
+	if len(files) == 0 {
+		return nil
+	}
+	cloned := make([]FileInfo, len(files))
+	copy(cloned, files)
+	return cloned
 }
 
 // walkDirectory 递归遍历单个目录
@@ -421,10 +494,17 @@ func (s *Service) sortFiles(files []FileInfo, order SortOrder, sortBy SortBy) {
 // ListDirectoryTree 获取所有配置目录的树结构。
 func (s *Service) ListDirectoryTree() ([]DirectoryTreeNode, error) {
 	trees := make([]DirectoryTreeNode, 0, len(s.directories))
+	files, err := s.getAllFilesSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	filesByDirectory := make(map[string][]FileInfo)
+	for _, file := range files {
+		filesByDirectory[file.Directory] = append(filesByDirectory[file.Directory], file)
+	}
 
 	for _, configuredDir := range s.directories {
-		basePath, ok := s.dirMap[configuredDir.Name]
-		if !ok {
+		if _, ok := s.dirMap[configuredDir.Name]; !ok {
 			continue
 		}
 
@@ -434,12 +514,7 @@ func (s *Service) ListDirectoryTree() ([]DirectoryTreeNode, error) {
 			Directory: configuredDir.Name,
 		}
 
-		files, err := s.walkDirectory(configuredDir.Name, basePath)
-		if err != nil {
-			return nil, err
-		}
-
-		for _, file := range files {
+		for _, file := range filesByDirectory[configuredDir.Name] {
 			root.FileCount++
 			parentDir := filepath.Dir(file.Path)
 			if parentDir == "." {
@@ -812,6 +887,7 @@ func (s *Service) InvalidateTitleCache(relativePath string) error {
 
 // InvalidateAllTitleCache 清除所有标题缓存
 func (s *Service) InvalidateAllTitleCache() error {
+	s.InvalidateFileIndexCache()
 	if s.redisClient == nil {
 		return nil
 	}
@@ -826,4 +902,13 @@ func (s *Service) InvalidateAllTitleCache() error {
 		return err
 	}
 	return nil
+}
+
+// InvalidateFileIndexCache clears the in-memory file index cache.
+func (s *Service) InvalidateFileIndexCache() {
+	s.indexMu.Lock()
+	defer s.indexMu.Unlock()
+	s.indexCache = nil
+	s.indexExpiry = time.Time{}
+	s.indexDirMts = nil
 }
